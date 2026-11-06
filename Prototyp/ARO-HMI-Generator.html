@@ -119,7 +119,7 @@ const types = /^(BOOL|SINT|USINT|BYTE|INT|UINT|WORD|DINT|UDINT|DWORD|REAL|LREAL|
 function importVariables(sheets) {
     const variables = new Map();
     for (const rows of sheets) {
-        let nameColumn, typeColumn;
+        let nameColumn, typeColumn, commentColumn;
         for (const row of rows) {
             const headers = Object.entries(row).map(([key, value]) => [key, value.toLowerCase().replace(/[\s_-]/g, '')]);
             const name = headers.find(([, value]) => /^(name|symbol|variablenname|tagname|membername)$/.test(value));
@@ -127,11 +127,14 @@ function importVariables(sheets) {
             if (name && type) {
                 [nameColumn] = name;
                 [typeColumn] = type;
+                commentColumn = headers.find(([, value]) => /^(kommentar|comment|description|beschreibung)$/.test(value))?.[0];
                 continue;
             }
             const member = row[nameColumn];
             const datatype = row[typeColumn]?.toUpperCase();
-            if (member && types.test(datatype)) variables.set(member, { member, type: datatype });
+            if (member && types.test(datatype)) variables.set(member, {
+                member, type: datatype, name: row[commentColumn] || member
+            });
         }
     }
     if (!variables.size) throw Error('Keine unterstützten Variablen gefunden. Erwartet werden Spalten Name und Datentyp.');
@@ -146,6 +149,12 @@ function renderVariables() {
         const row = text($('variables'), 'div');
         row.className = 'row';
         text(row, 'span', variable.member + ' · ' + variable.type);
+        const name = text(row, 'input');
+        name.type = 'text';
+        name.value = variable.name;
+        name.required = true;
+        name.setAttribute('aria-label', 'Anzeigename für ' + variable.member);
+        name.oninput = () => { variable.name = name.value; };
         const select = text(row, 'select');
         select.setAttribute('aria-label', 'Zugriff für ' + variable.member);
         for (const [value, label] of [['disabled', 'Ausblenden'], ['read', 'Lesen'], ['write', 'Lesen & Schreiben']]) {
@@ -156,21 +165,18 @@ function renderVariables() {
         select.onchange = () => {
             variable.access = select.value;
             preview.replaceChildren();
+            if (select.value !== 'read' || variable.type === 'BOOL') variable.operatingTime = false;
             if (select.value === 'disabled') return;
-            if (variable.type === 'BOOL') {
-                if (select.value === 'read') preview.textContent = '● Lampe';
-                else {
-                    const toggle = text(preview, 'input');
-                    toggle.type = 'checkbox';
-                    toggle.setAttribute('role', 'switch');
-                    toggle.setAttribute('aria-label', 'Toggle-Vorschau');
-                }
+            if (variable.type === 'BOOL') preview.textContent = select.value === 'read' ? '● Lampe' : 'Switch';
+            else if (select.value === 'read') {
+                const label = text(preview, 'label');
+                const checkbox = text(label, 'input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = !!variable.operatingTime;
+                checkbox.onchange = () => { variable.operatingTime = checkbox.checked; };
+                label.append(document.createTextNode(' Betriebszeit'));
             } else {
-                const number = text(preview, 'input');
-                number.type = 'number';
-                number.placeholder = '—';
-                number.readOnly = select.value === 'read';
-                number.setAttribute('aria-label', 'Zahlenfeld-Vorschau');
+                preview.textContent = 'Zahlenfeld';
             }
         };
         select.onchange();
@@ -183,10 +189,11 @@ $('machine').onsubmit = async event => {
     try {
         const file = $('xlsx').files[0];
         if (file !== importedFile) {
-            const previous = new Map(variables.map(v => [v.member + ':' + v.type, v.access]));
+            const previous = new Map(variables.map(v => [v.member + ':' + v.type, v]));
             const sheets = await readWorkbook(file);
             variables = importVariables(sheets).map(v => ({
-                ...v, access: previous.get(v.member + ':' + v.type) || 'read'
+                ...v, ...previous.get(v.member + ':' + v.type),
+                access: previous.get(v.member + ':' + v.type)?.access || 'read'
             }));
             for (const rows of sheets) {
                 const header = rows.find(row => Object.values(row).includes('Datentyp'));
@@ -236,7 +243,10 @@ $('faults').onsubmit = event => {
     const config = {
         api: { url: url.href },
         machine: Object.fromEntries(new FormData($('machine'))),
-        variables: variables.map(({ member, type, access }) => ({ tag: db + member, name: member, type, access })),
+        variables: variables.map(({ member, name, type, access, operatingTime }) => ({
+            tag: db + member, name: name.trim() || member, type, access,
+            ...(access === 'read' && type !== 'BOOL' && operatingTime ? { operatingTime: true } : {})
+        })),
         timestampFormat: 'raw',
         alarms: alarms.map(a => ({ id: a.id, name: a.custom?.value.trim() || a.name, enabled: a.enabled.checked,
             tag: db + array + '[' + a.id + ']' }))

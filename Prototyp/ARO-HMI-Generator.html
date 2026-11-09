@@ -19,6 +19,7 @@
   .row span { flex: 1 1 220px; overflow-wrap: anywhere }
   .row input[type=text] { flex: 1 1 220px; min-width: 0 }
   .row input[type=number] { width: 90px }
+  textarea { display: block; width: 100%; min-height: 160px; font: inherit }
   #message { color: #ffd593 }
 </style>
 <main>
@@ -34,9 +35,11 @@
       <label>Elektroschema<input name="Elektroschema"></label>
       <label>Softwareversion<input name="Softwareversion"></label>
       <label>Steuerung<input name="Steuerung" value="S7-1200 G2"></label>
-      <label>CPU-Adresse<input id="cpu" value="192.168.10.210" required></label>
+      <label>CPU-Adresse<input id="cpu" value="192.168.10.31" required></label>
       <label>DB-Name<input id="db" value="DB_HMI" required></label>
-      <label>Siemens-Export<input id="xlsx" type="file" accept=".xlsx" required></label>
+      <label>Import <select id="importMode"><option value="xlsx">Siemens-XLSX</option><option value="scl">SCL-Text</option></select></label>
+      <label id="xlsxField">Siemens-Export<input id="xlsx" type="file" accept=".xlsx" required></label>
+      <label id="sclField" hidden>SCL-Datenbaustein<textarea id="scl" spellcheck="false"></textarea></label>
     </div>
     <div class="actions"><button type="submit">Weiter</button></div>
   </form>
@@ -47,7 +50,8 @@
   </form>
   <form id="faults" hidden>
     <h2>3 / 3 · Fehlermeldungen</h2>
-    <label>BOOL-Array im DB, Index 1–96<input id="alarmArray" value="aStoOu" required></label>
+    <label>BOOL-Array im DB, Index 1–96<input id="alarmArray" value="aStoOu" list="alarmArrays" required></label>
+    <datalist id="alarmArrays"></datalist>
     <h3>Standardmeldungen 1–80</h3>
     <div id="standard"></div>
     <h3>Zusätzliche Meldungen 81–96</h3>
@@ -116,6 +120,32 @@ async function readWorkbook(file) {
 }
 
 const types = /^(BOOL|SINT|USINT|BYTE|INT|UINT|WORD|DINT|UDINT|DWORD|REAL|LREAL|TIME)$/;
+function readScl(source) {
+    const code = source.replace(/\(\*[\s\S]*?\*\)/g, '');
+    const block = /^\s*DATA_BLOCK[ \t]+"([^"\r\n]+)"/im.exec(code);
+    const declaration = code.split(/^[ \t]*BEGIN\b/im);
+    const sections = [...declaration[0].matchAll(/^[ \t]*VAR\b([\s\S]*?)^[ \t]*END_VAR\b/gim)];
+    if (!block || !sections.length || declaration.length < 2 || !/^[ \t]*END_DATA_BLOCK\b/im.test(code)) {
+        throw Error('Bitte einen vollständigen SCL-Datenbaustein mit DATA_BLOCK, VAR, END_VAR, BEGIN und END_DATA_BLOCK einfügen.');
+    }
+    const rows = [{ A: 'Name', B: 'Datentyp', C: 'Kommentar' }];
+    const members = /^[ \t]*([\p{L}_][\p{L}\p{N}_]*)[ \t]*(?:\{[^}]*\}\s*)?:\s*(ARRAY\s*\[[^\]]+\]\s*OF\s*\w+|\w+)[ \t]*(?::=[^;\r\n]*)?;[ \t]*(?:\/\/([^\r\n]*))?/gimu;
+    for (const [, section] of sections) {
+        for (const [, name, type, comment] of section.matchAll(members)) {
+            rows.push({ A: name, B: type.trim(), C: comment?.trim() || '' });
+        }
+    }
+    return { db: block[1], sheets: [rows] };
+}
+
+$('importMode').onchange = () => {
+    const scl = $('importMode').value === 'scl';
+    $('xlsxField').hidden = scl;
+    $('xlsx').required = !scl;
+    $('sclField').hidden = !scl;
+    $('scl').required = scl;
+};
+
 function importVariables(sheets) {
     const variables = new Map();
     for (const rows of sheets) {
@@ -141,7 +171,7 @@ function importVariables(sheets) {
     return [...variables.values()];
 }
 
-let importedFile;
+let importedSource;
 let variables = [];
 function renderVariables() {
     $('variables').replaceChildren();
@@ -165,10 +195,10 @@ function renderVariables() {
         select.onchange = () => {
             variable.access = select.value;
             preview.replaceChildren();
-            if (select.value !== 'read' || variable.type === 'BOOL') variable.operatingTime = false;
+            if (select.value !== 'read' || variable.type !== 'LREAL') variable.operatingTime = false;
             if (select.value === 'disabled') return;
             if (variable.type === 'BOOL') preview.textContent = select.value === 'read' ? '● Lampe' : 'Switch';
-            else if (select.value === 'read') {
+            else if (select.value === 'read' && variable.type === 'LREAL') {
                 const label = text(preview, 'label');
                 const checkbox = text(label, 'input');
                 checkbox.type = 'checkbox';
@@ -176,7 +206,7 @@ function renderVariables() {
                 checkbox.onchange = () => { variable.operatingTime = checkbox.checked; };
                 label.append(document.createTextNode(' Betriebszeit'));
             } else {
-                preview.textContent = 'Zahlenfeld';
+                preview.textContent = select.value === 'read' ? 'Zahlenanzeige' : 'Zahlenfeld';
             }
         };
         select.onchange();
@@ -187,22 +217,32 @@ $('machine').onsubmit = async event => {
     const button = event.submitter;
     button.disabled = true;
     try {
-        const file = $('xlsx').files[0];
-        if (file !== importedFile) {
+        const scl = $('importMode').value === 'scl';
+        const source = scl ? $('scl').value.trim() : $('xlsx').files[0];
+        if (source !== importedSource) {
             const previous = new Map(variables.map(v => [v.member + ':' + v.type, v]));
-            const sheets = await readWorkbook(file);
+            const imported = scl ? readScl(source) : { sheets: await readWorkbook(source) };
+            const { sheets } = imported;
             variables = importVariables(sheets).map(v => ({
                 ...v, ...previous.get(v.member + ':' + v.type),
                 access: previous.get(v.member + ':' + v.type)?.access || 'read'
             }));
+            if (scl) $('db').value = imported.db;
+            const arrays = new Set();
             for (const rows of sheets) {
                 const header = rows.find(row => Object.values(row).includes('Datentyp'));
                 if (!header) continue;
                 const column = label => Object.keys(header).find(key => header[key] === label);
-                const array = rows.find(row => /^ARRAY\s*\[\s*1\s*\.\.\s*96\s*\]\s*OF\s*BOOL$/i.test(row[column('Datentyp')]));
-                if (array?.[column('Name')]) $('alarmArray').value = array[column('Name')];
+                for (const row of rows) {
+                    if (/^ARRAY\s*\[\s*1\s*\.\.\s*96\s*\]\s*OF\s*BOOL$/i.test(row[column('Datentyp')]) && row[column('Name')]) {
+                        arrays.add(row[column('Name')]);
+                    }
+                }
             }
-            importedFile = file;
+            $('alarmArrays').replaceChildren();
+            for (const array of arrays) text($('alarmArrays'), 'option').value = array;
+            if (arrays.size) $('alarmArray').value = arrays.values().next().value;
+            importedSource = source;
             renderVariables();
         }
         show('access');
@@ -245,7 +285,7 @@ $('faults').onsubmit = event => {
         machine: Object.fromEntries(new FormData($('machine'))),
         variables: variables.map(({ member, name, type, access, operatingTime }) => ({
             tag: db + member, name: name.trim() || member, type, access,
-            ...(access === 'read' && type !== 'BOOL' && operatingTime ? { operatingTime: true } : {})
+            ...(access === 'read' && type === 'LREAL' && operatingTime ? { operatingTime: true } : {})
         })),
         timestampFormat: 'raw',
         alarms: alarms.map(a => ({ id: a.id, name: a.custom?.value.trim() || a.name, enabled: a.enabled.checked,

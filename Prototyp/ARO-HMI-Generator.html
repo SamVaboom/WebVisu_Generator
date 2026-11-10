@@ -52,6 +52,7 @@
     <h2>3 / 3 · Fehlermeldungen</h2>
     <label>BOOL-Array im DB, Index 1–96<input id="alarmArray" value="aStoOu" list="alarmArrays" required></label>
     <datalist id="alarmArrays"></datalist>
+    <label>Sto_96-Historie im DB (optional)<input id="historyArray" placeholder="aStoLog"></label>
     <h3>Standardmeldungen 1–80</h3>
     <div id="standard"></div>
     <h3>Zusätzliche Meldungen 81–96</h3>
@@ -129,7 +130,7 @@ function readScl(source) {
         throw Error('Bitte einen vollständigen SCL-Datenbaustein mit DATA_BLOCK, VAR, END_VAR, BEGIN und END_DATA_BLOCK einfügen.');
     }
     const rows = [{ A: 'Name', B: 'Datentyp', C: 'Kommentar' }];
-    const members = /^[ \t]*([\p{L}_][\p{L}\p{N}_]*)[ \t]*(?:\{[^}]*\}\s*)?:\s*(ARRAY\s*\[[^\]]+\]\s*OF\s*\w+|\w+)[ \t]*(?::=[^;\r\n]*)?;[ \t]*(?:\/\/([^\r\n]*))?/gimu;
+    const members = /^[ \t]*([\p{L}_][\p{L}\p{N}_]*)[ \t]*(?:\{[^}]*\}\s*)?:\s*(ARRAY\s*\[[^\]]+\]\s*OF\s*(?:"[^"\r\n]+"|\w+)|\w+)[ \t]*(?::=[^;\r\n]*)?;[ \t]*(?:\/\/([^\r\n]*))?/gimu;
     for (const [, section] of sections) {
         for (const [, name, type, comment] of section.matchAll(members)) {
             rows.push({ A: name, B: type.trim(), C: comment?.trim() || '' });
@@ -229,19 +230,26 @@ $('machine').onsubmit = async event => {
             }));
             if (scl) $('db').value = imported.db;
             const arrays = new Set();
+            let historyArray = '';
             for (const rows of sheets) {
-                const header = rows.find(row => Object.values(row).includes('Datentyp'));
+                const header = rows.find(row => Object.values(row).some(value => /^(datentyp|data\s*type|typ|type)$/i.test(value)));
                 if (!header) continue;
-                const column = label => Object.keys(header).find(key => header[key] === label);
+                const column = pattern => Object.keys(header).find(key => pattern.test(header[key]));
+                const name = column(/^(name|symbol|variablenname|tag\s*name|member\s*name)$/i);
+                const type = column(/^(datentyp|data\s*type|typ|type)$/i);
                 for (const row of rows) {
-                    if (/^ARRAY\s*\[\s*1\s*\.\.\s*96\s*\]\s*OF\s*BOOL$/i.test(row[column('Datentyp')]) && row[column('Name')]) {
-                        arrays.add(row[column('Name')]);
+                    if (/^ARRAY\s*\[\s*1\s*\.\.\s*96\s*\]\s*OF\s*BOOL$/i.test(row[type]) && row[name]) {
+                        arrays.add(row[name]);
+                    }
+                    if (!historyArray && /^ARRAY\s*\[\s*0\s*\.\.\s*1023\s*\]\s*OF\s*(?:"udtStoLog"|udtStoLog)$/i.test(row[type]) && row[name]) {
+                        historyArray = row[name];
                     }
                 }
             }
             $('alarmArrays').replaceChildren();
             for (const array of arrays) text($('alarmArrays'), 'option').value = array;
             if (arrays.size) $('alarmArray').value = arrays.values().next().value;
+            $('historyArray').value = historyArray;
             importedSource = source;
             renderVariables();
         }
@@ -270,6 +278,7 @@ $('faults').onsubmit = event => {
     event.preventDefault();
     const db = '"' + $('db').value.trim().replace(/^"|"$/g, '') + '".';
     const array = $('alarmArray').value.trim();
+    const historyArray = $('historyArray').value.trim();
     const host = $('cpu').value.trim();
     let url;
     try {
@@ -288,6 +297,7 @@ $('faults').onsubmit = event => {
             ...(access === 'read' && type === 'LREAL' && operatingTime ? { operatingTime: true } : {})
         })),
         timestampFormat: 'raw',
+        ...(historyArray ? { historyTag: db + historyArray } : {}),
         alarms: alarms.map(a => ({ id: a.id, name: a.custom?.value.trim() || a.name, enabled: a.enabled.checked,
             tag: db + array + '[' + a.id + ']' }))
     };
